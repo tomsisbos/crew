@@ -1,0 +1,19 @@
+# crew configuration — copy to ~/.config/crew/crew.conf and edit.
+# Every value below is also the built-in default, so an empty config is fine.
+
+# Name of the agmsg team all crew agents join.
+TEAM="crew"
+
+# Installed agmsg command name (the --cmd you passed to agmsg's install.sh).
+# Determines the script path ~/.agents/skills/<AGMSG_CMD>/scripts.
+AGMSG_CMD="agmsg"
+
+# Which herdr agent_status transitions the bridge announces to teammates.
+# Space-separated subset of: blocked idle working
+#   blocked = agent is waiting for input
+#   idle    = agent finished its turn / is free
+#   working = agent started working (noisy; off by default)
+BRIDGE_TRANSITIONS="blocked idle"
+
+# How often (seconds) the bridge polls herdr for state changes.
+BRIDGE_INTERVAL="3"

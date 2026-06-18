@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+#
+# crew-bridge — surface herdr agent-state transitions into the agmsg message stream.
+#
+# For each crew-managed agent (recorded by `crew new` under the state dir), it polls
+# herdr for the pane's agent_status. On a *meaningful* transition (default: -> blocked,
+# -> idle) it sends a short message to every other crew agent on the same team, so a
+# teammate going blocked ("needs input") or idle ("turn done") proactively reaches the
+# others without anyone polling.
+#
+# This is intentionally a poll loop (pure bash + jq): herdr's pane.agent_status_changed
+# socket subscription needs a pane_id per pane, so a poll over `herdr pane list` is the
+# simpler, more robust v1. See README "Roadmap" for the event-driven upgrade.
+#
+# Run via `crew bridge`; `crew new` also starts one in the background (pidfile under
+# the state dir keeps it a singleton).
+
+set -euo pipefail
+
+CREW_CONF="${CREW_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/crew/crew.conf}"
+TEAM="crew"
+AGMSG_CMD="agmsg"
+BRIDGE_TRANSITIONS="blocked idle"
+BRIDGE_INTERVAL="3"
+# shellcheck source=/dev/null
+[ -f "$CREW_CONF" ] && . "$CREW_CONF"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/crew"
+AGMSG_SCRIPTS="$HOME/.agents/skills/$AGMSG_CMD/scripts"
+SEND="$AGMSG_SCRIPTS/send.sh"
+
+# Human-readable hint per state.
+hint() {
+  case "$1" in
+    blocked) echo "needs input";;
+    idle)    echo "idle / turn done";;
+    working) echo "working";;
+    *)       echo "$1";;
+  esac
+}
+
+# Is <status> one of the configured transitions we announce?
+announces() {
+  local s="$1" t
+  for t in $BRIDGE_TRANSITIONS; do [ "$s" = "$t" ] && return 0; done
+  return 1
+}
+
+log() { printf '%s crew-bridge: %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+log "watching (team filter via registry; transitions: '$BRIDGE_TRANSITIONS'; interval ${BRIDGE_INTERVAL}s)"
+
+while :; do
+  snapshot="$(herdr pane list --json 2>/dev/null || true)"
+  if [ -n "$snapshot" ]; then
+    # iterate every registered crew agent
+    for desc in "$STATE_DIR"/agents/*/*.json; do
+      [ -f "$desc" ] || continue
+      name="$(jq -r '.name' "$desc")"
+      team="$(jq -r '.team' "$desc")"
+      pane="$(jq -r '.pane_id' "$desc")"
+      laststatus_file="${desc%.json}.laststatus"
+
+      status="$(printf '%s' "$snapshot" \
+        | jq -r --arg p "$pane" '.result.panes[]? | select(.pane_id==$p) | .agent_status')"
+      # pane gone (worktree retired) — leave the registry alone, just skip.
+      [ -n "$status" ] || continue
+
+      last="unknown"; [ -f "$laststatus_file" ] && last="$(cat "$laststatus_file")"
+      [ "$status" = "$last" ] && continue
+
+      printf '%s' "$status" >"$laststatus_file"
+      log "$team/$name: $last -> $status"
+      announces "$status" || continue
+
+      # fan out to the other crew members on the same team
+      for other_desc in "$STATE_DIR/agents/$team"/*.json; do
+        [ -f "$other_desc" ] || continue
+        other="$(jq -r '.name' "$other_desc")"
+        [ "$other" = "$name" ] && continue
+        "$SEND" "$team" crew-bridge "$other" "$name → $status ($(hint "$status"))" >/dev/null 2>&1 || true
+      done
+    done
+  fi
+  sleep "$BRIDGE_INTERVAL"
+done

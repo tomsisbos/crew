@@ -1,0 +1,5 @@
+# crew keeps no state in the repo — runtime state lives in
+# $XDG_STATE_HOME/crew (default ~/.local/state/crew) and config in
+# $XDG_CONFIG_HOME/crew. These are just editor / OS noise.
+*.log
+.DS_Store

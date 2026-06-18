@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# crew — a minimal agent orchestrator on top of herdr + agmsg.
+#
+# herdr owns the worktree + pane lifecycle and the at-a-glance state view;
+# agmsg owns the cross-agent messaging. crew is the thin glue that does the one
+# tedious thing — spawn-and-wire a new agent in a single command — plus a small
+# state->message bridge so teammates learn about each other in near real time.
+#
+# Commands:
+#   crew new <branch> [task...]   Create a worktree workspace, launch Claude in it,
+#                                 register it on the agmsg team, and start the bridge.
+#   crew bridge                   Run the herdr-state -> agmsg-message bridge (foreground).
+#                                 'crew new' starts this in the background automatically.
+#   crew help                     Show this help.
+#
+# Everything else is done with the tools' own commands (see README): the herdr
+# sidebar / `herdr agent list` for status, `/agmsg` for messaging, and
+# `herdr worktree remove` + agmsg leave.sh to retire an agent.
+
+set -euo pipefail
+
+# --- resolve our own absolute path so we can re-exec the sibling crew-bridge ---
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+BRIDGE_BIN="$SELF_DIR/crew-bridge"
+
+# --- config (overridable via CREW_CONF) ---
+CREW_CONF="${CREW_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/crew/crew.conf}"
+# defaults — kept in sync with crew.conf.example
+TEAM="crew"
+AGMSG_CMD="agmsg"
+BRIDGE_TRANSITIONS="blocked idle"
+BRIDGE_INTERVAL="3"
+# shellcheck source=/dev/null
+[ -f "$CREW_CONF" ] && . "$CREW_CONF"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/crew"
+AGMSG_SCRIPTS="$HOME/.agents/skills/$AGMSG_CMD/scripts"
+
+die() { printf 'crew: %s\n' "$*" >&2; exit 1; }
+
+require() {
+  command -v herdr >/dev/null 2>&1 || die "herdr not found on PATH (see https://herdr.dev)"
+  command -v jq    >/dev/null 2>&1 || die "jq not found on PATH"
+  command -v git   >/dev/null 2>&1 || die "git not found on PATH"
+  [ -d "$AGMSG_SCRIPTS" ] || die "agmsg not installed at $AGMSG_SCRIPTS (see https://agmsg.cc)"
+  herdr status server >/dev/null 2>&1 || die "herdr server not running — start it with 'herdr server' or open 'herdr'"
+}
+
+# Turn a branch name into a safe, stable agmsg agent name + workspace label.
+slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' | sed -E 's/-+/-/g; s/^-|-$//g'; }
+
+ensure_bridge() {
+  local pidfile="$STATE_DIR/bridge.pid"
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+    return 0
+  fi
+  mkdir -p "$STATE_DIR"
+  nohup "$BRIDGE_BIN" >>"$STATE_DIR/bridge.log" 2>&1 &
+  echo $! >"$pidfile"
+  echo "crew: started bridge (pid $(cat "$pidfile"), log $STATE_DIR/bridge.log)"
+}
+
+cmd_new() {
+  [ $# -ge 1 ] || die "usage: crew new <branch> [task...]"
+  local branch="$1"; shift
+  local task="$*"
+  local name; name="$(slug "$branch")"
+  [ -n "$name" ] || die "branch '$branch' produced an empty agent name"
+
+  local repo_root
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
+
+  # 1. herdr: create the git worktree AND open it as a workspace (one call).
+  local json
+  json="$(herdr worktree create --cwd "$repo_root" --branch "$branch" --label "$name" --no-focus --json)" \
+    || die "herdr worktree create failed for branch '$branch' (does it already exist?)"
+  local pane_id checkout ws_id
+  pane_id="$(printf '%s' "$json" | jq -r '.result.root_pane.pane_id')"
+  checkout="$(printf '%s' "$json" | jq -r '.result.worktree.path')"
+  ws_id="$(printf '%s' "$json"   | jq -r '.result.workspace.workspace_id')"
+  [ -n "$pane_id" ] && [ "$pane_id" != null ] || die "could not read pane_id from herdr response"
+
+  # 2. agmsg: register this worktree as a team member keyed on the *checkout path*.
+  #    AGMSG_RESOLVE_PROJECT=0 stores the raw checkout path instead of resolving it
+  #    back to the main repo root — that is what keeps each worktree a distinct identity.
+  AGMSG_RESOLVE_PROJECT=0 "$AGMSG_SCRIPTS/join.sh" "$TEAM" "$name" claude-code "$checkout" >/dev/null \
+    || die "agmsg join failed for '$name'"
+
+  # 3. agmsg: install monitor-mode delivery into the worktree's .claude/settings.local.json,
+  #    baking the same checkout path into the SessionStart hook so the watcher resolves
+  #    this exact identity. ~5s push delivery of incoming messages.
+  "$AGMSG_SCRIPTS/delivery.sh" set monitor claude-code "$checkout" >/dev/null \
+    || die "agmsg delivery setup failed for '$name'"
+
+  # 4. herdr: surface the task as the pane's custom status (shows in the sidebar).
+  if [ -n "$task" ]; then
+    herdr pane report-metadata "$pane_id" --source crew --custom-status "$task" >/dev/null 2>&1 || true
+  fi
+
+  # 5. record the crew registry entry (the bridge reads these).
+  mkdir -p "$STATE_DIR/agents/$TEAM"
+  jq -n --arg name "$name" --arg team "$TEAM" --arg pane "$pane_id" \
+        --arg ws "$ws_id" --arg co "$checkout" --arg task "$task" \
+    '{name:$name, team:$team, pane_id:$pane, workspace_id:$ws, checkout:$co, task:$task}' \
+    >"$STATE_DIR/agents/$TEAM/$name.json"
+  echo "unknown" >"$STATE_DIR/agents/$TEAM/$name.laststatus"
+
+  # 6. launch Claude in the worktree pane.
+  herdr pane run "$pane_id" "claude" >/dev/null 2>&1 || die "failed to launch claude in pane $pane_id"
+
+  # 7. make sure the bridge is watching.
+  ensure_bridge
+
+  cat <<EOF
+crew: agent '$name' ready
+  team:      $TEAM
+  branch:    $branch
+  worktree:  $checkout
+  pane:      $pane_id  (workspace $ws_id)
+  task:      ${task:-<none>}
+
+Attach with 'herdr' (or 'herdr agent focus $name'). If its inbox does not light up
+on the first message, send it a quick 'hi' to prime monitor mode.
+EOF
+}
+
+cmd_bridge() { exec "$BRIDGE_BIN"; }
+
+usage() { sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+  local sub="${1:-help}"; shift || true
+  case "$sub" in
+    new)            require; cmd_new "$@";;
+    bridge)         require; cmd_bridge "$@";;
+    help|-h|--help) usage;;
+    *)              die "unknown command '$sub' (try: crew help)";;
+  esac
+}
+
+main "$@"
