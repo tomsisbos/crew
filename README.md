@@ -85,8 +85,10 @@ crew deliberately does **not** re-wrap these — use the tools directly:
 ## The bridge
 
 `crew bridge` polls `herdr pane list` and, when a crew agent transitions into a state
-listed in `BRIDGE_TRANSITIONS` (default `blocked idle`), sends a one-line note to every
-other crew agent on the team — e.g. `api-layer → blocked (needs input)`. `crew new` starts
+listed in `BRIDGE_TRANSITIONS` (default `blocked done`), sends a one-line note to every
+other crew agent on the team — e.g. `api-layer → blocked (needs input)`. (herdr reports a
+finished-but-unviewed agent as `done`, which is why that — not `idle` — is the default
+"free now" signal.) `crew new` starts
 it in the background (singleton via a pidfile under `~/.local/state/crew`). Run it in the
 foreground yourself with `crew bridge`; logs go to `~/.local/state/crew/bridge.log`.
 

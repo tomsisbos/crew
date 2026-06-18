@@ -29,10 +29,13 @@ CREW_CONF="${CREW_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/crew/crew.conf}"
 # defaults — kept in sync with crew.conf.example
 TEAM="crew"
 AGMSG_CMD="agmsg"
-BRIDGE_TRANSITIONS="blocked idle"
+AGENT_CMD="claude"
+BRIDGE_TRANSITIONS="blocked done"
 BRIDGE_INTERVAL="3"
 # shellcheck source=/dev/null
 [ -f "$CREW_CONF" ] && . "$CREW_CONF"
+# CREW_AGENT_CMD env wins over config/default (handy for flags or testing).
+AGENT_CMD="${CREW_AGENT_CMD:-$AGENT_CMD}"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/crew"
 AGMSG_SCRIPTS="$HOME/.agents/skills/$AGMSG_CMD/scripts"
@@ -106,8 +109,8 @@ cmd_new() {
     >"$STATE_DIR/agents/$TEAM/$name.json"
   echo "unknown" >"$STATE_DIR/agents/$TEAM/$name.laststatus"
 
-  # 6. launch Claude in the worktree pane.
-  herdr pane run "$pane_id" "claude" >/dev/null 2>&1 || die "failed to launch claude in pane $pane_id"
+  # 6. launch the agent in the worktree pane (AGENT_CMD, default "claude").
+  herdr pane run "$pane_id" "$AGENT_CMD" >/dev/null 2>&1 || die "failed to launch '$AGENT_CMD' in pane $pane_id"
 
   # 7. make sure the bridge is watching.
   ensure_bridge

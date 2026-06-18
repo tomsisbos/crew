@@ -20,7 +20,7 @@ set -euo pipefail
 CREW_CONF="${CREW_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/crew/crew.conf}"
 TEAM="crew"
 AGMSG_CMD="agmsg"
-BRIDGE_TRANSITIONS="blocked idle"
+BRIDGE_TRANSITIONS="blocked done"
 BRIDGE_INTERVAL="3"
 # shellcheck source=/dev/null
 [ -f "$CREW_CONF" ] && . "$CREW_CONF"
@@ -33,7 +33,8 @@ SEND="$AGMSG_SCRIPTS/send.sh"
 hint() {
   case "$1" in
     blocked) echo "needs input";;
-    idle)    echo "idle / turn done";;
+    done)    echo "finished / awaiting next";;
+    idle)    echo "idle / free";;
     working) echo "working";;
     *)       echo "$1";;
   esac
@@ -51,7 +52,7 @@ log() { printf '%s crew-bridge: %s\n' "$(date '+%H:%M:%S')" "$*"; }
 log "watching (team filter via registry; transitions: '$BRIDGE_TRANSITIONS'; interval ${BRIDGE_INTERVAL}s)"
 
 while :; do
-  snapshot="$(herdr pane list --json 2>/dev/null || true)"
+  snapshot="$(herdr pane list 2>/dev/null || true)"
   if [ -n "$snapshot" ]; then
     # iterate every registered crew agent
     for desc in "$STATE_DIR"/agents/*/*.json; do

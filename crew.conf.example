@@ -8,12 +8,18 @@ TEAM="crew"
 # Determines the script path ~/.agents/skills/<AGMSG_CMD>/scripts.
 AGMSG_CMD="agmsg"
 
+# Command launched in each worktree pane. Override per-run with CREW_AGENT_CMD,
+# e.g. to pass flags: CREW_AGENT_CMD="claude --model opus" crew new ...
+AGENT_CMD="claude"
+
 # Which herdr agent_status transitions the bridge announces to teammates.
-# Space-separated subset of: blocked idle working
+# Space-separated subset of: blocked done idle working
 #   blocked = agent is waiting for input
-#   idle    = agent finished its turn / is free
+#   done    = agent finished its turn and hasn't been viewed (what `herdr pane
+#             list` reports for a finished agent — the usual "free now" signal)
+#   idle    = finished AND already viewed (rarely seen by a headless bridge)
 #   working = agent started working (noisy; off by default)
-BRIDGE_TRANSITIONS="blocked idle"
+BRIDGE_TRANSITIONS="blocked done"
 
 # How often (seconds) the bridge polls herdr for state changes.
 BRIDGE_INTERVAL="3"
