@@ -12,6 +12,9 @@
 #                                 register it on the agmsg team, and start the bridge.
 #   crew bridge                   Run the herdr-state -> agmsg-message bridge (foreground).
 #                                 'crew new' starts this in the background automatically.
+#   crew watch                    Auto-adopt any herdr-created worktree as a wired agent
+#                                 (foreground). 'crew watch service install' registers it as
+#                                 a login service; install.sh does this for you.
 #   crew help                     Show this help.
 #
 # Everything else is done with the tools' own commands (see README): the herdr
@@ -20,9 +23,10 @@
 
 set -euo pipefail
 
-# --- resolve our own absolute path so we can re-exec the sibling crew-bridge ---
+# --- resolve our own absolute path so we can re-exec the sibling crew-bridge / crew-watch ---
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 BRIDGE_BIN="$SELF_DIR/crew-bridge"
+WATCH_BIN="$SELF_DIR/crew-watch"
 
 # --- config (overridable via CREW_CONF) ---
 CREW_CONF="${CREW_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/crew/crew.conf}"
@@ -130,13 +134,18 @@ EOF
 
 cmd_bridge() { exec "$BRIDGE_BIN"; }
 
-usage() { sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'; }
+# crew watch [service <install|uninstall>] — re-exec the sibling crew-watch (CREW_BIN lets
+# its service installer point the login agent at this same crew binary).
+cmd_watch() { CREW_BIN="$SELF_DIR/crew" exec "$WATCH_BIN" "$@"; }
+
+usage() { sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local sub="${1:-help}"; shift || true
   case "$sub" in
     new)            require; cmd_new "$@";;
     bridge)         require; cmd_bridge "$@";;
+    watch)          cmd_watch "$@";;
     help|-h|--help) usage;;
     *)              die "unknown command '$sub' (try: crew help)";;
   esac
