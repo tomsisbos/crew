@@ -39,9 +39,15 @@ the piece they don't: a single spawn-and-wire command, plus a small state→mess
 ```sh
 git clone https://github.com/<you>/crew.git
 cd crew
-./install.sh                 # symlinks crew + crew-bridge into ~/.local/bin
+./install.sh                 # symlinks crew/-bridge/-watch + registers the watch service
 herdr integration install claude   # one time: wires Claude state detection into herdr
 ```
+
+`install.sh` also registers **`crew watch`** as a login service (launchd on macOS, systemd
+`--user` on Linux) so any worktree you create in herdr becomes a wired agent automatically —
+see [Auto-adopt from the herdr UI](#auto-adopt-from-the-herdr-ui-crew-watch). Skip it with
+`./install.sh --no-service` (or `CREW_NO_SERVICE=1`); remove it later with
+`crew watch service uninstall`.
 
 Edit `~/.config/crew/crew.conf` to set your team name (defaults shown in
 [`crew.conf.example`](crew.conf.example)).
@@ -69,6 +75,38 @@ Then just `herdr` to see and attach to everyone.
 > First-message priming: in monitor mode a fresh agent won't react to its very first
 > inbound message until it has taken one turn. If an agent seems silent, send it a quick
 > `hi` to prime it (this is an agmsg behavior, not a crew bug).
+
+## Auto-adopt from the herdr UI (`crew watch`)
+
+`crew new` is the explicit path. But you can also create worktrees straight from herdr and
+have crew wire them for you — `crew watch` polls herdr and adopts any **linked worktree** it
+hasn't seen, running the exact same steps 2–6 above (join → delivery → status → registry →
+launch claude → ensure bridge). This decouples *spawning an agent* from *how the worktree was
+made*: the herdr menu button, the keybinding, the palette, or `herdr worktree create` on the
+CLI all end up as fully-wired agents.
+
+```
+in herdr:  spaces panel → "menu" → New worktree → <branch>
+           (or the new-worktree keybinding: prefix+shift+g, where prefix = ctrl+b)
+                                   │  ~WATCH_INTERVAL s later
+                                   ▼
+crew watch:  join · delivery set monitor · custom-status · registry · run "claude" · ensure bridge
+```
+
+- **It's automatic.** `install.sh` registers `crew watch` as a login service
+  (`RunAtLoad` + `KeepAlive`), so it starts at login, restarts on crash, and survives closing
+  and reopening herdr (it idle-polls while herdr is down and resumes when it's back). Nothing
+  to remember. Run it in the foreground for debugging with `crew watch`; logs go to
+  `~/.local/state/crew/watch.log`.
+- **Only worktrees become agents.** The plain **"new"** button makes a workspace on the
+  *main* checkout, which shares the repo path and so can't be a distinct agmsg identity. crew
+  ignores it — and (unless `WATCH_NUDGE=0`) pops a herdr toast nudging you to use *New
+  worktree* instead.
+- **Caveat — monitor mode on auto-launched panes.** If your herdr opens new panes already
+  running `claude` (rather than a shell), the agent may have started *before* crew wrote its
+  delivery hook; crew primes it with a `hi`, but it can need one restart to enter monitor
+  mode. When herdr opens a shell (the default) and crew launches `claude` itself, there's no
+  race.
 
 ## How you do the rest (native commands)
 
@@ -105,8 +143,9 @@ exactly one identity — no `actas` disambiguation needed.
 - `crew status` — a single joined herdr + agmsg view.
 - `crew msg` / `crew retire` — convenience wrappers (native commands work today).
 - A `/crew` Claude Code skill to spawn/coordinate from inside an agent.
-- **Event-driven bridge** — replace the poll with herdr's `events.subscribe`
-  (`pane.agent_status_changed`) socket stream once it's wired per-pane.
+- **Event-driven watch + bridge** — `crew watch` ships the polling version today; replace the
+  poll with herdr's `events.subscribe` (`worktree.*` / `pane.agent_status_changed`) socket
+  stream once it's wired per-pane.
 - **Remote** — herdr `--remote ssh://host` for herding agents on a remote box, with the
   agmsg room on that host.
 
