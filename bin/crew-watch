@@ -69,7 +69,9 @@ adopt() {
   name="$(slug "${branch:-$label}")"
   [ -n "$name" ] && [ "$name" != "-" ] || name="$(slug "$(basename "$path")")"
   [ -n "$name" ] || return 0
-  status_text="${label:-$branch}"
+  # herdr's worktree .label is the repo name, not the branch — use the branch for the
+  # sidebar status so each adopted agent is distinguishable.
+  status_text="${branch:-$label}"
 
   # already adopted? (our registry, or an existing agmsg membership for this path)
   [ -f "$STATE_DIR/agents/$TEAM/$name.json" ] && return 0
