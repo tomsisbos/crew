@@ -23,3 +23,11 @@ BRIDGE_TRANSITIONS="blocked done"
 
 # How often (seconds) the bridge polls herdr for state changes.
 BRIDGE_INTERVAL="3"
+
+# How often (seconds) `crew watch` polls herdr for new worktrees to adopt.
+WATCH_INTERVAL="3"
+
+# Whether `crew watch` shows a herdr toast when you create a plain (non-worktree)
+# workspace on the main checkout — a reminder that only worktrees become crew agents.
+# Set to "0" to silence it.
+WATCH_NUDGE="1"

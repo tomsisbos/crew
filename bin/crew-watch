@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+#
+# crew-watch — adopt herdr-created worktrees into crew automatically.
+#
+# Polls herdr for git worktrees and, for every *linked* worktree that crew has not
+# registered yet, runs the same wiring `crew new` does: agmsg join (keyed on the checkout
+# path), monitor-mode delivery, a herdr custom-status, a crew registry entry, and a `claude`
+# launch in the worktree's pane. This decouples "spawn a crew agent" from *how* the worktree
+# was created — herdr's menu button, the prefix+shift+g chord, the palette, or `crew new` all
+# end up as fully-wired agents.
+#
+# It also re-ensures `crew bridge` on every poll, so a single login service (see
+# `crew watch service install`) keeps the whole crew plane alive.
+#
+# Like crew-bridge this is intentionally a poll loop (bash + jq): herdr 0.7 exposes no
+# worktree-creation hook or event stream. See README "Roadmap" for the event-driven upgrade.
+#
+# Run via `crew watch`; normally started at login by the launchd/systemd service that
+# `install.sh` registers.
+
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+CREW_BIN="${CREW_BIN:-$SELF_DIR/crew}"
+BRIDGE_BIN="$SELF_DIR/crew-bridge"
+
+CREW_CONF="${CREW_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/crew/crew.conf}"
+TEAM="crew"
+AGMSG_CMD="agmsg"
+WATCH_INTERVAL="3"
+WATCH_NUDGE="1"
+# shellcheck source=/dev/null
+[ -f "$CREW_CONF" ] && . "$CREW_CONF"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/crew"
+AGMSG_SCRIPTS="$HOME/.agents/skills/$AGMSG_CMD/scripts"
+JOIN="$AGMSG_SCRIPTS/join.sh"
+DELIVERY="$AGMSG_SCRIPTS/delivery.sh"
+IDENTITIES="$AGMSG_SCRIPTS/identities.sh"
+SEEN="$STATE_DIR/watch/seen-workspaces"
+
+# agmsg keys identity on the raw checkout path — don't let it collapse a worktree back to
+# the main repo root (same reason crew new sets this).
+export AGMSG_RESOLVE_PROJECT=0
+
+log() { printf '%s crew-watch: %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+# branch/label -> safe, stable agmsg agent name + workspace label (same rule as crew).
+slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' | sed -E 's/-+/-/g; s/^-|-$//g'; }
+
+# --- bridge singleton (mirrors crew's ensure_bridge; called every poll so it self-heals) ---
+ensure_bridge() {
+  local pidfile="$STATE_DIR/bridge.pid"
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+    return 0
+  fi
+  mkdir -p "$STATE_DIR"
+  nohup "$BRIDGE_BIN" >>"$STATE_DIR/bridge.log" 2>&1 &
+  echo $! >"$pidfile"
+  log "started bridge (pid $(cat "$pidfile"), log $STATE_DIR/bridge.log)"
+}
+
+# --- adopt one linked worktree as a wired crew agent -------------------------------------
+# args: <checkout_path> <workspace_id> <branch> <label>
+adopt() {
+  local path="$1" ws_id="$2" branch="$3" label="$4"
+  local name status_text pane agent
+
+  name="$(slug "${branch:-$label}")"
+  [ -n "$name" ] && [ "$name" != "-" ] || name="$(slug "$(basename "$path")")"
+  [ -n "$name" ] || return 0
+  # herdr's worktree .label is the repo name, not the branch — use the branch for the
+  # sidebar status so each adopted agent is distinguishable.
+  status_text="${branch:-$label}"
+
+  # already adopted? (our registry, or an existing agmsg membership for this path)
+  [ -f "$STATE_DIR/agents/$TEAM/$name.json" ] && return 0
+  if [ -x "$IDENTITIES" ] && [ -n "$("$IDENTITIES" "$path" claude-code 2>/dev/null || true)" ]; then
+    return 0
+  fi
+
+  # find the worktree's pane (and whether an agent is already running in it).
+  local pane_line
+  pane_line="$(printf '%s' "$PANE_JSON" \
+    | jq -r --arg ws "$ws_id" 'first(.result.panes[]? | select(.workspace_id==$ws)) | [(.pane_id // ""), (.agent // "")] | @tsv' 2>/dev/null || true)"
+  pane="$(printf '%s' "$pane_line" | cut -f1)"
+  agent="$(printf '%s' "$pane_line" | cut -f2)"
+  [ -n "$pane" ] || return 0   # no pane yet — try again next poll
+
+  # 1. register on the team, keyed on the checkout path.
+  if ! "$JOIN" "$TEAM" "$name" claude-code "$path" >/dev/null 2>&1; then
+    log "join failed for '$name' ($path)"; return 0
+  fi
+  # 2. install monitor-mode delivery BEFORE the agent starts (so it binds at session start).
+  "$DELIVERY" set monitor claude-code "$path" >/dev/null 2>&1 \
+    || log "delivery setup failed for '$name'"
+  # 3. surface the task/label as the pane custom-status.
+  herdr pane report-metadata "$pane" --source crew --custom-status "$status_text" >/dev/null 2>&1 || true
+  # 4. crew registry entry (the bridge reads these).
+  mkdir -p "$STATE_DIR/agents/$TEAM"
+  jq -n --arg name "$name" --arg team "$TEAM" --arg pane "$pane" \
+        --arg ws "$ws_id" --arg co "$path" --arg task "$status_text" \
+    '{name:$name, team:$team, pane_id:$pane, workspace_id:$ws, checkout:$co, task:$task}' \
+    >"$STATE_DIR/agents/$TEAM/$name.json"
+  echo "unknown" >"$STATE_DIR/agents/$TEAM/$name.laststatus"
+
+  # 5. launch the agent — or, if herdr already started one, prime it.
+  if [ "$agent" = "claude" ]; then
+    herdr agent send "$name" "hi" >/dev/null 2>&1 || true
+    log "adopted '$name' (branch ${branch:-?}) — claude already running; primed (may need a restart for monitor mode)"
+  else
+    herdr pane run "$pane" claude >/dev/null 2>&1 || log "failed to launch claude in pane $pane"
+    log "adopted '$name' (branch ${branch:-?}, worktree $path)"
+  fi
+}
+
+# --- nudge: a plain (non-worktree) workspace on the main checkout isn't a crew agent ------
+nudge_check() {
+  [ "$WATCH_NUDGE" = "1" ] || return 0
+  local id root cnt
+  mkdir -p "$STATE_DIR/watch"; touch "$SEEN"
+  while IFS=$'\t' read -r id root; do
+    [ -n "$id" ] || continue
+    grep -qxF "$id" "$SEEN" 2>/dev/null && continue
+    echo "$id" >>"$SEEN"
+    # more than one non-linked workspace on the same repo root => this one is a stray dup.
+    cnt="$(printf '%s' "$WS_JSON" | jq -r --arg r "$root" \
+      '[.result.workspaces[]? | select((.worktree.is_linked_worktree==false) and (.worktree.repo_root==$r))] | length' 2>/dev/null || echo 0)"
+    if [ "${cnt:-0}" -gt 1 ]; then
+      herdr notification show "Not a crew agent" \
+        --body "A plain workspace isn't wired into crew. Use the menu → New worktree to spawn a crew agent." \
+        --sound request >/dev/null 2>&1 || true
+      log "nudge: plain workspace $id on $root is not a crew agent"
+    fi
+  done < <(printf '%s' "$WS_JSON" \
+    | jq -r '.result.workspaces[]? | select(.worktree.is_linked_worktree==false) | [.workspace_id, (.worktree.repo_root // "")] | @tsv' 2>/dev/null || true)
+}
+
+# Seed the seen-set with whatever exists now, so we only nudge on workspaces created later.
+seed_seen() {
+  mkdir -p "$STATE_DIR/watch"
+  printf '%s' "$WS_JSON" | jq -r '.result.workspaces[]?.workspace_id' >"$SEEN" 2>/dev/null || : >"$SEEN"
+}
+
+# --- daemon loop -------------------------------------------------------------------------
+run_daemon() {
+  log "watching (team '$TEAM'; interval ${WATCH_INTERVAL}s; nudge=$WATCH_NUDGE)"
+  WS_JSON="$(herdr workspace list 2>/dev/null || true)"
+  seed_seen
+  while :; do
+    WT_JSON="$(herdr worktree list --json 2>/dev/null || true)"
+    PANE_JSON="$(herdr pane list 2>/dev/null || true)"
+    WS_JSON="$(herdr workspace list 2>/dev/null || true)"
+    ensure_bridge
+
+    if [ -n "$WT_JSON" ] && [ -n "$PANE_JSON" ]; then
+      while IFS=$'\t' read -r path ws_id branch label; do
+        [ -n "$path" ] && [ -n "$ws_id" ] || continue
+        adopt "$path" "$ws_id" "$branch" "$label"
+      done < <(printf '%s' "$WT_JSON" \
+        | jq -r '.result.worktrees[]? | select(.is_linked_worktree==true) | [.path, (.open_workspace_id // ""), (.branch // ""), (.label // "")] | @tsv' 2>/dev/null || true)
+    fi
+
+    [ -n "$WS_JSON" ] && nudge_check
+    sleep "$WATCH_INTERVAL"
+  done
+}
+
+# --- login service (launchd on macOS, systemd --user on Linux) ---------------------------
+LAUNCHD_LABEL="dev.crew.watch"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+SYSTEMD_UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/crew-watch.service"
+
+service_install() {
+  mkdir -p "$STATE_DIR"
+  case "$(uname -s)" in
+    Darwin)
+      mkdir -p "$(dirname "$LAUNCHD_PLIST")"
+      cat >"$LAUNCHD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LAUNCHD_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$CREW_BIN</string>
+    <string>watch</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$STATE_DIR/watch.log</string>
+  <key>StandardErrorPath</key><string>$STATE_DIR/watch.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
+PLIST
+      launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || true
+      launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST" 2>/dev/null || launchctl load "$LAUNCHD_PLIST" 2>/dev/null || true
+      launchctl enable "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || true
+      echo "crew watch: launchd service installed ($LAUNCHD_PLIST)"
+      echo "  remove with: crew watch service uninstall   ·   logs: $STATE_DIR/watch.log"
+      ;;
+    Linux)
+      mkdir -p "$(dirname "$SYSTEMD_UNIT")"
+      cat >"$SYSTEMD_UNIT" <<UNIT
+[Unit]
+Description=crew watch — auto-adopt herdr worktrees as crew agents
+
+[Service]
+ExecStart=$CREW_BIN watch
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+UNIT
+      systemctl --user daemon-reload 2>/dev/null || true
+      systemctl --user enable --now crew-watch.service 2>/dev/null || true
+      echo "crew watch: systemd --user service installed ($SYSTEMD_UNIT)"
+      echo "  remove with: crew watch service uninstall   ·   logs: journalctl --user -u crew-watch"
+      ;;
+    *)
+      echo "crew watch: no auto-start integration for '$(uname -s)'." >&2
+      echo "Run 'crew watch' yourself (e.g. from your login shell or a process manager)." >&2
+      ;;
+  esac
+}
+
+service_uninstall() {
+  case "$(uname -s)" in
+    Darwin)
+      launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null \
+        || launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
+      rm -f "$LAUNCHD_PLIST"
+      echo "crew watch: launchd service removed"
+      ;;
+    Linux)
+      systemctl --user disable --now crew-watch.service 2>/dev/null || true
+      rm -f "$SYSTEMD_UNIT"
+      systemctl --user daemon-reload 2>/dev/null || true
+      echo "crew watch: systemd --user service removed"
+      ;;
+    *) echo "crew watch: nothing to remove on '$(uname -s)'." ;;
+  esac
+}
+
+main() {
+  case "${1:-}" in
+    "")        run_daemon;;
+    service)
+      case "${2:-}" in
+        install)   service_install;;
+        uninstall) service_uninstall;;
+        *) echo "usage: crew watch service <install|uninstall>" >&2; exit 1;;
+      esac
+      ;;
+    *) echo "usage: crew watch [service <install|uninstall>]" >&2; exit 1;;
+  esac
+}
+
+main "$@"

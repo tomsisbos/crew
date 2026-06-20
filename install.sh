@@ -2,9 +2,13 @@
 #
 # install.sh — put crew on your PATH and lay down a default config.
 #
-# Symlinks bin/crew and bin/crew-bridge into ~/.local/bin (override with CREW_BIN_DIR),
-# and copies crew.conf.example to ~/.config/crew/crew.conf if you don't have one yet.
-# Idempotent: safe to re-run.
+# Symlinks bin/crew, bin/crew-bridge and bin/crew-watch into ~/.local/bin (override with
+# CREW_BIN_DIR), copies crew.conf.example to ~/.config/crew/crew.conf if you don't have one
+# yet, and registers the crew-watch login service so worktrees you create in herdr become
+# wired agents automatically. Idempotent: safe to re-run.
+#
+# Flags / env:
+#   --no-service  (or CREW_NO_SERVICE=1)  skip registering the crew-watch login service.
 
 set -euo pipefail
 
@@ -13,6 +17,14 @@ BIN_DIR="${CREW_BIN_DIR:-$HOME/.local/bin}"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/crew"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/crew"
 AGMSG_CMD="${AGMSG_CMD:-agmsg}"
+
+NO_SERVICE="${CREW_NO_SERVICE:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --no-service) NO_SERVICE=1 ;;
+    *) printf 'crew install: unknown argument: %s\n' "$arg" >&2; exit 1 ;;
+  esac
+done
 
 ok()   { printf '  \033[32m+\033[0m %s\n' "$*"; }
 warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
@@ -44,11 +56,11 @@ fi
 
 # --- symlink binaries ---
 mkdir -p "$BIN_DIR"
-for b in crew crew-bridge; do
+for b in crew crew-bridge crew-watch; do
   ln -sf "$SRC_DIR/bin/$b" "$BIN_DIR/$b"
   ok "linked $BIN_DIR/$b"
 done
-chmod +x "$SRC_DIR/bin/crew" "$SRC_DIR/bin/crew-bridge"
+chmod +x "$SRC_DIR/bin/crew" "$SRC_DIR/bin/crew-bridge" "$SRC_DIR/bin/crew-watch"
 
 # --- config + state dirs ---
 mkdir -p "$CONF_DIR" "$STATE_DIR"
@@ -66,6 +78,17 @@ case ":$PATH:" in
      warn "  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.zshrc && exec zsh" ;;
 esac
 
+# --- crew-watch login service (auto-adopt herdr worktrees) ---
+if [ "$NO_SERVICE" = "1" ]; then
+  warn "skipping crew-watch service (--no-service) — start it yourself with 'crew watch'"
+else
+  if "$BIN_DIR/crew" watch service install; then
+    ok "registered crew-watch login service"
+  else
+    warn "could not register crew-watch service — start it yourself with 'crew watch'"
+  fi
+fi
+
 cat <<EOF
 
 Done. Next steps:
@@ -73,8 +96,9 @@ Done. Next steps:
        herdr integration install claude
   2. Start herdr (server + UI):
        herdr
-  3. From inside any git repo, spawn an agent:
-       crew new my-feature "draft the API layer"
+  3. Spawn agents either way — both end up fully wired:
+       • In herdr: menu → New worktree (crew-watch adopts it automatically), or
+       • From a terminal: crew new my-feature "draft the API layer"
 
 See the README for the status / messaging / retire cheatsheet.
 EOF
