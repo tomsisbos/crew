@@ -24,6 +24,13 @@ BRIDGE_TRANSITIONS="blocked done"
 # How often (seconds) the bridge polls herdr for state changes.
 BRIDGE_INTERVAL="3"
 
+# Echo-suppression window (seconds). In monitor mode, a delivered note wakes an agent,
+# which flips it working -> done; the bridge ignores such a transition if it lands within
+# this many seconds of the bridge pinging that agent, so notes don't reverberate forever.
+# Larger = safer against slow reaction turns; smaller = announces genuine changes sooner.
+# (blocked is always announced, regardless of this window.)
+BRIDGE_ECHO_WINDOW="60"
+
 # How often (seconds) `crew watch` polls herdr for new worktrees to adopt.
 WATCH_INTERVAL="3"
 

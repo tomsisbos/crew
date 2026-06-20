@@ -2,11 +2,18 @@
 #
 # crew-bridge — surface herdr agent-state transitions into the agmsg message stream.
 #
-# For each crew-managed agent (recorded by `crew new` under the state dir), it polls
-# herdr for the pane's agent_status. On a *meaningful* transition (default: -> blocked,
-# -> idle) it sends a short message to every other crew agent on the same team, so a
-# teammate going blocked ("needs input") or idle ("turn done") proactively reaches the
-# others without anyone polling.
+# For each crew-managed agent (recorded by `crew new` / `crew watch` under the state dir),
+# it polls herdr for the pane's agent_status. On a *meaningful* transition (default: ->
+# blocked, -> done) it sends a short message to every other crew agent on the same team, so
+# a teammate going blocked ("needs input") or done ("turn finished, free now") proactively
+# reaches the others without anyone polling.
+#
+# Echo-suppression: in monitor mode a delivered note wakes the recipient, who takes a turn
+# and so flips working -> done — which would be re-announced, waking everyone again, forever.
+# To break that, we remember when we last *pinged* each agent; if it transitions into an
+# announce state within BRIDGE_ECHO_WINDOW seconds of that ping, we treat it as the echo of
+# our own message and stay quiet. `blocked` is exempt (a ping never *causes* blocked, and the
+# reaction to a blocked note is a done — which is suppressed — so it can't sustain a loop).
 #
 # This is intentionally a poll loop (pure bash + jq): herdr's pane.agent_status_changed
 # socket subscription needs a pane_id per pane, so a poll over `herdr pane list` is the
@@ -22,12 +29,15 @@ TEAM="crew"
 AGMSG_CMD="agmsg"
 BRIDGE_TRANSITIONS="blocked done"
 BRIDGE_INTERVAL="3"
+BRIDGE_ECHO_WINDOW="60"
 # shellcheck source=/dev/null
 [ -f "$CREW_CONF" ] && . "$CREW_CONF"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/crew"
 AGMSG_SCRIPTS="$HOME/.agents/skills/$AGMSG_CMD/scripts"
 SEND="$AGMSG_SCRIPTS/send.sh"
+# Per-agent "<name>.lastping" files record the epoch we last sent that agent a note (used
+# for echo-suppression). File-based to stay bash-3.2 compatible (no associative arrays).
 
 # Human-readable hint per state.
 hint() {
@@ -52,6 +62,7 @@ log() { printf '%s crew-bridge: %s\n' "$(date '+%H:%M:%S')" "$*"; }
 log "watching (team filter via registry; transitions: '$BRIDGE_TRANSITIONS'; interval ${BRIDGE_INTERVAL}s)"
 
 while :; do
+  NOW="$(date +%s)"
   snapshot="$(herdr pane list 2>/dev/null || true)"
   if [ -n "$snapshot" ]; then
     # iterate every registered crew agent
@@ -74,12 +85,27 @@ while :; do
       log "$team/$name: $last -> $status"
       announces "$status" || continue
 
+      # echo-suppression: if this agent transitioned right after we pinged it, it's just
+      # reacting to our note (working -> done) — announcing it would wake everyone again in
+      # an endless loop. Stay quiet. 'blocked' is exempt: a ping never causes it, and the
+      # reaction to a blocked note is a done (suppressed), so it can't sustain a loop.
+      if [ "$status" != "blocked" ]; then
+        lastping_file="${desc%.json}.lastping"
+        lastping=0; [ -f "$lastping_file" ] && lastping="$(cat "$lastping_file")"
+        if [ "$((NOW - lastping))" -le "$BRIDGE_ECHO_WINDOW" ]; then
+          log "$team/$name: $status suppressed (echo of a bridge ping $((NOW - lastping))s ago)"
+          continue
+        fi
+      fi
+
       # fan out to the other crew members on the same team
       for other_desc in "$STATE_DIR/agents/$team"/*.json; do
         [ -f "$other_desc" ] || continue
         other="$(jq -r '.name' "$other_desc")"
         [ "$other" = "$name" ] && continue
         "$SEND" "$team" crew-bridge "$other" "$name → $status ($(hint "$status"))" >/dev/null 2>&1 || true
+        # remember we pinged this teammate, so its imminent working->done echo stays quiet.
+        printf '%s' "$NOW" >"${other_desc%.json}.lastping"
       done
     done
   fi
