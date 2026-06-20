@@ -66,16 +66,6 @@ crew new api-layer "draft the REST handlers"
 Either way: **one worktree = one herdr workspace = one agmsg agent**. Run `herdr` to watch and
 attach to everyone.
 
-**Done with an agent?** Remove its worktree in herdr (spaces panel → **menu → Remove
-worktree**) and crew tears down the rest — its agmsg identity and state — within seconds. Or
-do it explicitly with the inverse of `crew new`:
-
-```sh
-crew end api-layer
-```
-
-Your git branch is left intact either way.
-
 Good to know:
 
 - The plain **"new"** button makes a workspace on the *main* checkout — that can't be its own
@@ -95,20 +85,35 @@ crew deliberately does **not** re-wrap these — use the tools directly:
 | See the team roster | `~/.agents/skills/agmsg/scripts/team.sh <team>` (or `/agmsg team` inside an agent) |
 | Send a message between agents | `/agmsg send <agent> <message>` (inside a Claude pane) |
 | Check an inbox | `/agmsg` (inside a Claude pane) |
-| Retire an agent | remove its worktree in herdr (crew auto-cleans), or `crew end <name>` |
+| Retire an agent | `herdr worktree remove --workspace <id>` then `…/agmsg/scripts/leave.sh <team> <name>` |
 
 ## The bridge
 
-So teammates learn about each other without anyone watching, a small background process pings
-the others whenever a crew agent **needs input** or **finishes its turn** — e.g.
-`api-layer → blocked (needs input)`. It starts automatically with your agents; logs are at
-`~/.local/state/crew/bridge.log`. Tune what it announces in
-[`crew.conf.example`](crew.conf.example).
+`crew bridge` polls `herdr pane list` and, when a crew agent transitions into a state listed in
+`BRIDGE_TRANSITIONS` (default `blocked done`), sends a one-line note to every other crew agent
+on the team — e.g. `api-layer → blocked (needs input)`. (herdr reports a finished-but-unviewed
+agent as `done`, which is why that — not `idle` — is the default "free now" signal.) `crew new`
+and `crew watch` start it in the background (singleton via a pidfile under
+`~/.local/state/crew`); run it yourself with `crew bridge`, logs at
+`~/.local/state/crew/bridge.log`.
+
+To stop notes from reverberating — a delivered note wakes an agent, which flips it
+`working → done`, which would be announced again — the bridge **suppresses the echo**: a
+transition that lands within `BRIDGE_ECHO_WINDOW` seconds of the bridge pinging that agent is
+treated as its reaction to our note and stays quiet (`blocked` is always announced).
+
+## How identity stays stable per worktree
+
+agmsg keys an agent identity on `(project_path, type)`. crew registers each agent under its
+**worktree checkout path** (with `AGMSG_RESOLVE_PROJECT=0`, so agmsg stores the raw path
+instead of collapsing the worktree back to the main repo root). The same checkout path is
+baked into that worktree's monitor `SessionStart` hook, so the running Claude resolves to
+exactly one identity — no `actas` disambiguation needed.
 
 ## Roadmap
 
 - `crew status` — a single joined herdr + agmsg view.
-- `crew msg` — a convenience wrapper for messaging (native `/agmsg` works today).
+- `crew msg` / `crew retire` — convenience wrappers (native commands work today).
 - A `/crew` Claude Code skill to spawn/coordinate from inside an agent.
 - **Event-driven watch + bridge** — `crew watch` ships the polling version today; replace the
   poll with herdr's `events.subscribe` (`worktree.*` / `pane.agent_status_changed`) socket

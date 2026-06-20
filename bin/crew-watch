@@ -142,28 +142,6 @@ seed_seen() {
   printf '%s' "$WS_JSON" | jq -r '.result.workspaces[]?.workspace_id' >"$SEEN" 2>/dev/null || : >"$SEEN"
 }
 
-# --- reap: the mirror of adopt -----------------------------------------------------------
-# When a registered agent's worktree no longer exists in herdr (you removed it in the UI),
-# tear the agent down via `crew end` — the same teardown the user runs manually, so there's
-# one implementation. Only acts on a *valid* worktree list: a herdr hiccup (empty/garbage
-# response) must never be mistaken for "all worktrees gone" and reap every agent. A worktree
-# on disk but not open as a workspace still has a .path here, so it stays alive.
-reap() {
-  printf '%s' "$WT_JSON" | jq -e '.result.worktrees' >/dev/null 2>&1 || return 0
-  local alive desc co name
-  alive="$(printf '%s' "$WT_JSON" | jq -r '.result.worktrees[]?.path')"
-  for desc in "$STATE_DIR/agents/$TEAM"/*.json; do
-    [ -f "$desc" ] || continue
-    co="$(jq -r '.checkout // ""' "$desc")"
-    [ -n "$co" ] || continue
-    if ! printf '%s\n' "$alive" | grep -qxF "$co"; then
-      name="$(jq -r '.name' "$desc")"
-      "$CREW_BIN" end "$name" >/dev/null 2>&1 || true
-      log "reaped '$name' (worktree gone: $co)"
-    fi
-  done
-}
-
 # --- daemon loop -------------------------------------------------------------------------
 run_daemon() {
   log "watching (team '$TEAM'; interval ${WATCH_INTERVAL}s; nudge=$WATCH_NUDGE)"
@@ -183,7 +161,6 @@ run_daemon() {
         | jq -r '.result.worktrees[]? | select(.is_linked_worktree==true) | [.path, (.open_workspace_id // ""), (.branch // ""), (.label // "")] | @tsv' 2>/dev/null || true)
     fi
 
-    reap
     [ -n "$WS_JSON" ] && nudge_check
     sleep "$WATCH_INTERVAL"
   done
