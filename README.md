@@ -97,6 +97,11 @@ and `crew watch` start it in the background (singleton via a pidfile under
 `~/.local/state/crew`); run it yourself with `crew bridge`, logs at
 `~/.local/state/crew/bridge.log`.
 
+To stop notes from reverberating — a delivered note wakes an agent, which flips it
+`working → done`, which would be announced again — the bridge **suppresses the echo**: a
+transition that lands within `BRIDGE_ECHO_WINDOW` seconds of the bridge pinging that agent is
+treated as its reaction to our note and stays quiet (`blocked` is always announced).
+
 ## How identity stays stable per worktree
 
 agmsg keys an agent identity on `(project_path, type)`. crew registers each agent under its
