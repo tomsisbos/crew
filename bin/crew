@@ -15,11 +15,12 @@
 #   crew watch                    Auto-adopt any herdr-created worktree as a wired agent
 #                                 (foreground). 'crew watch service install' registers it as
 #                                 a login service; install.sh does this for you.
+#   crew end <name>               Tear down an agent: remove its worktree, leave the team, and
+#                                 delete its state. The inverse of 'crew new'.
 #   crew help                     Show this help.
 #
 # Everything else is done with the tools' own commands (see README): the herdr
-# sidebar / `herdr agent list` for status, `/agmsg` for messaging, and
-# `herdr worktree remove` + agmsg leave.sh to retire an agent.
+# sidebar / `herdr agent list` for status, and `/agmsg` for messaging.
 
 set -euo pipefail
 
@@ -138,7 +139,42 @@ cmd_bridge() { exec "$BRIDGE_BIN"; }
 # its service installer point the login agent at this same crew binary).
 cmd_watch() { CREW_BIN="$SELF_DIR/crew" exec "$WATCH_BIN" "$@"; }
 
-usage() { sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; }
+# crew end <name> — the inverse of crew new: remove the worktree (if it's still ours), leave
+# the agmsg team, and delete the crew state files. Idempotent; leaves the git branch intact.
+# Shared implementation: crew-watch's auto-reaper calls this too.
+cmd_end() {
+  [ $# -ge 1 ] || die "usage: crew end <name>"
+  local name; name="$(slug "$1")"
+  [ -n "$name" ] || die "could not derive an agent name from '$1'"
+  local desc="$STATE_DIR/agents/$TEAM/$name.json"
+  [ -f "$desc" ] || die "no crew agent '$name' on team '$TEAM'"
+
+  local ws checkout cur
+  ws="$(jq -r '.workspace_id // ""' "$desc")"
+  checkout="$(jq -r '.checkout // ""' "$desc")"
+
+  # Remove the herdr worktree only if that workspace still maps to our checkout — so an
+  # already-removed worktree, or a reused wN id, is never touched.
+  if [ -n "$ws" ]; then
+    cur="$(herdr workspace list 2>/dev/null | jq -r --arg w "$ws" \
+      '.result.workspaces[]? | select(.workspace_id==$w) | .worktree.checkout_path // ""')"
+    if [ "$cur" = "$checkout" ]; then
+      herdr worktree remove --workspace "$ws" --force >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # Leave the agmsg team (errors if already gone — ignored).
+  "$AGMSG_SCRIPTS/leave.sh" "$TEAM" "$name" >/dev/null 2>&1 || true
+
+  # Drop the crew registry/state files. The git branch is intentionally left intact.
+  rm -f "$STATE_DIR/agents/$TEAM/$name".json \
+        "$STATE_DIR/agents/$TEAM/$name".laststatus \
+        "$STATE_DIR/agents/$TEAM/$name".lastping
+
+  echo "crew: retired '$name' (team '$TEAM'; branch left intact)"
+}
+
+usage() { sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local sub="${1:-help}"; shift || true
@@ -146,6 +182,7 @@ main() {
     new)            require; cmd_new "$@";;
     bridge)         require; cmd_bridge "$@";;
     watch)          cmd_watch "$@";;
+    end)            cmd_end "$@";;
     help|-h|--help) usage;;
     *)              die "unknown command '$sub' (try: crew help)";;
   esac
