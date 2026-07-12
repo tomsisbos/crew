@@ -85,6 +85,23 @@ while :; do
       log "$team/$name: $last -> $status"
       announces "$status" || continue
 
+      # de-dup on the *terminal state we last broadcast* for this agent. A long-idle
+      # session (e.g. a Codex-monitored one) legitimately cycles done->idle->working->done
+      # forever — woken by our own broadcasts, teammate replies, or heartbeat turns — and
+      # each landing on the same terminal state carries no new information for teammates
+      # (still "done / free" or still "blocked"). laststatus above only collapses two
+      # *identical consecutive* polls; it does not remember what we already announced across
+      # a done->working->done round-trip, so without this guard every such round-trip
+      # re-fans-out to the whole team. Announce only when the terminal state differs from
+      # the one we last actually sent, so a genuine blocked<->done alternation still gets
+      # through but a repeat of the same state does not.
+      lastannounce_file="${desc%.json}.lastannounce"
+      lastannounce=""; [ -f "$lastannounce_file" ] && lastannounce="$(cat "$lastannounce_file")"
+      if [ "$status" = "$lastannounce" ]; then
+        log "$team/$name: $status not re-announced (already broadcast; no new terminal state)"
+        continue
+      fi
+
       # echo-suppression: if this agent transitioned right after we pinged it, it's just
       # reacting to our note (working -> done) — announcing it would wake everyone again in
       # an endless loop. Stay quiet. 'blocked' is exempt: a ping never causes it, and the
@@ -107,6 +124,9 @@ while :; do
         # remember we pinged this teammate, so its imminent working->done echo stays quiet.
         printf '%s' "$NOW" >"${other_desc%.json}.lastping"
       done
+      # record the terminal state we just broadcast so a later done->working->done (or
+      # blocked->working->blocked) round-trip for this same agent is not re-announced.
+      printf '%s' "$status" >"$lastannounce_file"
     done
   fi
   sleep "$BRIDGE_INTERVAL"
