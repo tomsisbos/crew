@@ -1,43 +1,45 @@
 #!/usr/bin/env bash
 #
-# crew-bridge — surface herdr agent-state transitions into the agmsg message stream.
+# crew-bridge — surface herdr agent-state transitions.
 #
-# For each crew-managed agent (recorded by `crew new` / `crew watch` under the state dir),
-# it polls herdr for the pane's agent_status. On a *meaningful* transition (default: ->
-# blocked, -> done) it sends a short message to every other crew agent on the same team, so
-# a teammate going blocked ("needs input") or done ("turn finished, free now") proactively
-# reaches the others without anyone polling.
+# Agent state (done / idle / working) is PULL-ONLY: read it on demand with
+# `crew status`, the herdr sidebar, or `herdr pane list`. The bridge no longer
+# pushes state into the agmsg message stream. Doing so was expensive and noisy:
+# crew agents run in agmsg *monitor* mode, where every delivered row wakes the
+# recipient and costs it a full turn — so a single "X is done" fan-out spent
+# (team-1) turns on telemetry nobody acted on, and the wakeups it caused flipped
+# recipients working->done, which got re-announced, waking everyone again in an
+# endless broadcast->wake->rebroadcast loop.
 #
-# Echo-suppression: in monitor mode a delivered note wakes the recipient, who takes a turn
-# and so flips working -> done — which would be re-announced, waking everyone again, forever.
-# To break that, we remember when we last *pinged* each agent; if it transitions into an
-# announce state within BRIDGE_ECHO_WINDOW seconds of that ping, we treat it as the echo of
-# our own message and stay quiet. `blocked` is exempt (a ping never *causes* blocked, and the
-# reaction to a blocked note is a done — which is suppressed — so it can't sustain a loop).
+# Directed agent<->agent messages still flow through agmsg untouched — those are
+# real notifications and worth a wakeup. State is not.
 #
-# This is intentionally a poll loop (pure bash + jq): herdr's pane.agent_status_changed
-# socket subscription needs a pane_id per pane, so a poll over `herdr pane list` is the
-# simpler, more robust v1. See README "Roadmap" for the event-driven upgrade.
+# The one state with proactive value is `blocked` ("needs input") — but the
+# audience is the human, not the peer agents. On a transition into a notify
+# state (default: blocked) the bridge raises a herdr desktop notification, which
+# costs zero agent tokens. Everything else is left for `crew status` to pull.
 #
-# Run via `crew bridge`; `crew new` also starts one in the background (pidfile under
-# the state dir keeps it a singleton).
+# Intentionally a poll loop (pure bash + jq) over `herdr pane list`: herdr 0.7's
+# pane.agent_status_changed subscription needs a pane_id per pane, so a poll is
+# the simpler, more robust v1. See README "Roadmap" for the event-driven upgrade.
+#
+# Run via `crew bridge`; `crew new` / `crew watch` also start one in the
+# background (pidfile under the state dir keeps it a singleton).
 
 set -euo pipefail
 
 CREW_CONF="${CREW_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/crew/crew.conf}"
 TEAM="crew"
 AGMSG_CMD="agmsg"
-BRIDGE_TRANSITIONS="blocked done"
+# States that raise a (human-facing) herdr notification on entry. Space-separated
+# subset of: blocked done idle working. Default: blocked only — the sole state a
+# person needs to act on. State is otherwise pull-only (see `crew status`).
+BRIDGE_NOTIFY="blocked"
 BRIDGE_INTERVAL="3"
-BRIDGE_ECHO_WINDOW="60"
 # shellcheck source=/dev/null
 [ -f "$CREW_CONF" ] && . "$CREW_CONF"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/crew"
-AGMSG_SCRIPTS="$HOME/.agents/skills/$AGMSG_CMD/scripts"
-SEND="$AGMSG_SCRIPTS/send.sh"
-# Per-agent "<name>.lastping" files record the epoch we last sent that agent a note (used
-# for echo-suppression). File-based to stay bash-3.2 compatible (no associative arrays).
 
 # Human-readable hint per state.
 hint() {
@@ -50,19 +52,18 @@ hint() {
   esac
 }
 
-# Is <status> one of the configured transitions we announce?
-announces() {
+# Is <status> one of the configured states we raise a human notification for?
+notifies() {
   local s="$1" t
-  for t in $BRIDGE_TRANSITIONS; do [ "$s" = "$t" ] && return 0; done
+  for t in $BRIDGE_NOTIFY; do [ "$s" = "$t" ] && return 0; done
   return 1
 }
 
 log() { printf '%s crew-bridge: %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
-log "watching (team filter via registry; transitions: '$BRIDGE_TRANSITIONS'; interval ${BRIDGE_INTERVAL}s)"
+log "watching (notify human on: '$BRIDGE_NOTIFY'; other state is pull-only via 'crew status'; interval ${BRIDGE_INTERVAL}s)"
 
 while :; do
-  NOW="$(date +%s)"
   snapshot="$(herdr pane list 2>/dev/null || true)"
   if [ -n "$snapshot" ]; then
     # iterate every registered crew agent
@@ -81,52 +82,21 @@ while :; do
       last="unknown"; [ -f "$laststatus_file" ] && last="$(cat "$laststatus_file")"
       [ "$status" = "$last" ] && continue
 
+      # Record the transition so `crew status` and the log stay current. This is
+      # the only side effect for done/idle/working — they are pull-only now.
       printf '%s' "$status" >"$laststatus_file"
       log "$team/$name: $last -> $status"
-      announces "$status" || continue
 
-      # de-dup on the *terminal state we last broadcast* for this agent. A long-idle
-      # session (e.g. a Codex-monitored one) legitimately cycles done->idle->working->done
-      # forever — woken by our own broadcasts, teammate replies, or heartbeat turns — and
-      # each landing on the same terminal state carries no new information for teammates
-      # (still "done / free" or still "blocked"). laststatus above only collapses two
-      # *identical consecutive* polls; it does not remember what we already announced across
-      # a done->working->done round-trip, so without this guard every such round-trip
-      # re-fans-out to the whole team. Announce only when the terminal state differs from
-      # the one we last actually sent, so a genuine blocked<->done alternation still gets
-      # through but a repeat of the same state does not.
-      lastannounce_file="${desc%.json}.lastannounce"
-      lastannounce=""; [ -f "$lastannounce_file" ] && lastannounce="$(cat "$lastannounce_file")"
-      if [ "$status" = "$lastannounce" ]; then
-        log "$team/$name: $status not re-announced (already broadcast; no new terminal state)"
-        continue
-      fi
-
-      # echo-suppression: if this agent transitioned right after we pinged it, it's just
-      # reacting to our note (working -> done) — announcing it would wake everyone again in
-      # an endless loop. Stay quiet. 'blocked' is exempt: a ping never causes it, and the
-      # reaction to a blocked note is a done (suppressed), so it can't sustain a loop.
-      if [ "$status" != "blocked" ]; then
-        lastping_file="${desc%.json}.lastping"
-        lastping=0; [ -f "$lastping_file" ] && lastping="$(cat "$lastping_file")"
-        if [ "$((NOW - lastping))" -le "$BRIDGE_ECHO_WINDOW" ]; then
-          log "$team/$name: $status suppressed (echo of a bridge ping $((NOW - lastping))s ago)"
-          continue
-        fi
-      fi
-
-      # fan out to the other crew members on the same team
-      for other_desc in "$STATE_DIR/agents/$team"/*.json; do
-        [ -f "$other_desc" ] || continue
-        other="$(jq -r '.name' "$other_desc")"
-        [ "$other" = "$name" ] && continue
-        "$SEND" "$team" crew-bridge "$other" "$name → $status ($(hint "$status"))" >/dev/null 2>&1 || true
-        # remember we pinged this teammate, so its imminent working->done echo stays quiet.
-        printf '%s' "$NOW" >"${other_desc%.json}.lastping"
-      done
-      # record the terminal state we just broadcast so a later done->working->done (or
-      # blocked->working->blocked) round-trip for this same agent is not re-announced.
-      printf '%s' "$status" >"$lastannounce_file"
+      # The only proactive push left is a desktop notification to the human, for
+      # the configured notify states (default: blocked = needs input). No agmsg
+      # fan-out to peers — that woke the whole team for telemetry and looped.
+      # laststatus above already gates this to real transitions *into* the state,
+      # so a steady blocked agent is toasted once, not every poll.
+      notifies "$status" || continue
+      herdr notification show "crew: $name — $(hint "$status")" \
+        --body "$name → $status ($(hint "$status")). Open it in herdr to respond." \
+        --sound request >/dev/null 2>&1 \
+        || log "$team/$name: herdr notification failed (is the herdr server up?)"
     done
   fi
   sleep "$BRIDGE_INTERVAL"

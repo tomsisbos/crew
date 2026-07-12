@@ -12,24 +12,21 @@ AGMSG_CMD="agmsg"
 # e.g. to pass flags: CREW_AGENT_CMD="claude --model opus" crew new ...
 AGENT_CMD="claude"
 
-# Which herdr agent_status transitions the bridge announces to teammates.
+# Which herdr agent_status transitions raise a *desktop notification to you*.
 # Space-separated subset of: blocked done idle working
-#   blocked = agent is waiting for input
-#   done    = agent finished its turn and hasn't been viewed (what `herdr pane
-#             list` reports for a finished agent — the usual "free now" signal)
-#   idle    = finished AND already viewed (rarely seen by a headless bridge)
-#   working = agent started working (noisy; off by default)
-BRIDGE_TRANSITIONS="blocked done"
+#   blocked = agent is waiting for input  (the one state a human should act on)
+#   done    = agent finished its turn      (usually just noise for a person)
+#   idle    = finished AND already viewed
+#   working = agent started working
+# Default is blocked only. Agent state is otherwise PULL-ONLY: the bridge no
+# longer pushes it into teammates' agmsg inboxes (that woke every agent and cost
+# a turn each in monitor mode). Read state on demand with `crew status`, the
+# herdr sidebar, or `herdr pane list`. Directed agent<->agent agmsg messages are
+# unaffected — those are real notifications and still delivered.
+BRIDGE_NOTIFY="blocked"
 
 # How often (seconds) the bridge polls herdr for state changes.
 BRIDGE_INTERVAL="3"
-
-# Echo-suppression window (seconds). In monitor mode, a delivered note wakes an agent,
-# which flips it working -> done; the bridge ignores such a transition if it lands within
-# this many seconds of the bridge pinging that agent, so notes don't reverberate forever.
-# Larger = safer against slow reaction turns; smaller = announces genuine changes sooner.
-# (blocked is always announced, regardless of this window.)
-BRIDGE_ECHO_WINDOW="60"
 
 # How often (seconds) `crew watch` polls herdr for new worktrees to adopt.
 WATCH_INTERVAL="3"

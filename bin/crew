@@ -10,15 +10,18 @@
 # Commands:
 #   crew new <branch> [task...]   Create a worktree workspace, launch Claude in it,
 #                                 register it on the agmsg team, and start the bridge.
-#   crew bridge                   Run the herdr-state -> agmsg-message bridge (foreground).
-#                                 'crew new' starts this in the background automatically.
+#   crew status                   Print each crew agent's current herdr state and task
+#                                 (pull view — the bridge does not push state anymore).
+#   crew bridge                   Run the herdr-state watcher (foreground). It only raises
+#                                 a desktop notification when an agent goes blocked; state
+#                                 is pull-only. 'crew new' starts this in the background.
 #   crew watch                    Auto-adopt any herdr-created worktree as a wired agent
 #                                 (foreground). 'crew watch service install' registers it as
 #                                 a login service; install.sh does this for you.
 #   crew help                     Show this help.
 #
 # Everything else is done with the tools' own commands (see README): the herdr
-# sidebar / `herdr agent list` for status, `/agmsg` for messaging, and
+# sidebar for the live view, `/agmsg` for directed messaging, and
 # `herdr worktree remove` + agmsg leave.sh to retire an agent.
 
 set -euo pipefail
@@ -34,7 +37,6 @@ CREW_CONF="${CREW_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/crew/crew.conf}"
 TEAM="crew"
 AGMSG_CMD="agmsg"
 AGENT_CMD="claude"
-BRIDGE_TRANSITIONS="blocked done"
 BRIDGE_INTERVAL="3"
 # shellcheck source=/dev/null
 [ -f "$CREW_CONF" ] && . "$CREW_CONF"
@@ -132,6 +134,31 @@ on the first message, send it a quick 'hi' to prime monitor mode.
 EOF
 }
 
+# crew status — pull view of every crew agent's current herdr state + task. This
+# replaces the bridge's old fan-out: state is read on demand instead of pushed
+# into every teammate's inbox (which cost a turn per teammate in monitor mode).
+cmd_status() {
+  local snapshot; snapshot="$(herdr pane list 2>/dev/null || true)"
+  [ -n "$snapshot" ] || die "could not read 'herdr pane list' (is the herdr server up?)"
+
+  local any=0
+  printf '%-30s %-9s %s\n' "AGENT" "STATE" "TASK"
+  local desc
+  for desc in "$STATE_DIR/agents/$TEAM"/*.json; do
+    [ -f "$desc" ] || continue
+    any=1
+    local name pane task status
+    name="$(jq -r '.name' "$desc")"
+    pane="$(jq -r '.pane_id' "$desc")"
+    task="$(jq -r '.task // ""' "$desc")"
+    status="$(printf '%s' "$snapshot" \
+      | jq -r --arg p "$pane" '.result.panes[]? | select(.pane_id==$p) | .agent_status')"
+    [ -n "$status" ] || status="-"   # pane gone (worktree retired) or not reporting yet
+    printf '%-30s %-9s %s\n' "$name" "$status" "$task"
+  done
+  [ "$any" = 1 ] || echo "crew: no agents registered on team '$TEAM'."
+}
+
 cmd_bridge() { exec "$BRIDGE_BIN"; }
 
 # crew watch [service <install|uninstall>] — re-exec the sibling crew-watch (CREW_BIN lets
@@ -144,6 +171,7 @@ main() {
   local sub="${1:-help}"; shift || true
   case "$sub" in
     new)            require; cmd_new "$@";;
+    status)         require; cmd_status "$@";;
     bridge)         require; cmd_bridge "$@";;
     watch)          cmd_watch "$@";;
     help|-h|--help) usage;;
